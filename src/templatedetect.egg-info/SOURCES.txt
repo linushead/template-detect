@@ -1,0 +1,12 @@
+LICENSE
+setup.py
+src/templatedetect/__init__.py
+src/templatedetect.egg-info/PKG-INFO
+src/templatedetect.egg-info/SOURCES.txt
+src/templatedetect.egg-info/dependency_links.txt
+src/templatedetect.egg-info/not-zip-safe
+src/templatedetect.egg-info/top_level.txt
+src/templatedetect/arcs/__init__.py
+src/templatedetect/arcs/detect.py
+src/templatedetect/blobs/__init__.py
+src/templatedetect/blobs/detect.py

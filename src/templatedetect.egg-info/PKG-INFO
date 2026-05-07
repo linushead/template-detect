@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: templatedetect
+Version: 0.1
+Summary: A library for detecting blobs and arcs in images using template matching
+Author-email: head.linus0@gmail.com
+License-File: LICENSE
+Dynamic: author-email
+Dynamic: license-file
+Dynamic: summary

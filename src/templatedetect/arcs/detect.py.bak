@@ -1,0 +1,776 @@
+import numpy as np
+import pandas as pd
+import multiprocessing
+from joblib import Parallel, delayed
+import itertools
+import scipy
+import skimage
+import sknw
+import circle_fit
+import matplotlib.pyplot as plt
+import matplotlib.cm
+from sklearn.cluster import DBSCAN, HDBSCAN
+import distinctipy
+
+def DetectArcs(images, elementSizes = [13], widths = [13], fwhms = [8], noiseSeeds = list(range(0,5)), maxProcess = -1):
+
+    images = np.asarray(images)
+    
+    if images.ndim == 2:
+        images = images[np.newaxis,...]
+
+    if images.ndim != 3:
+        raise ValueError("\"image\" must be a 2D or 3D array.")
+   
+    # Creating the dataframe that will contain the output arcs.
+    df = pd.DataFrame()
+
+        
+    # Performing the arc detection in a multiprocessing wrapper.
+    # inputs_MP = [[images[k,:,:].copy(), k, elementSizes.copy(), widths.copy(), fwhms.copy(), noiseSeeds.copy(), False] for k in range(images.shape[0])]
+                
+    # arcsDicts = Parallel(n_jobs = maxProcess)(
+        # delayed(ArcDetector_MP)(
+            # images[k], k, elementSizes, widths, fwhms, noiseSeeds, False
+        # ) for k in range(images.shape[0])
+    # )
+    
+    arcsDicts = ArcDetector_MP(images, elementSizes, widths, fwhms, noiseSeeds, False)
+    
+    # arcsDicts = [ArcDetector_MP(images[k,:,:], k, elementSizes, widths, fwhms, noiseSeeds, False) for k in range(images.shape[0])]
+    
+    arcsDict = []
+    for entry in arcsDicts:
+        arcsDict.extend(entry)
+            
+    if len(arcsDict) == 0:
+        arcsDict = [ {"frame" : 0, "scores" : [], "points" : []} ]
+        
+        
+        
+    
+    # Putting curveRegions into a dataframe format.
+    df = pd.DataFrame.from_dict(arcsDict)
+    df = df.sort_values(["frame"])
+    df = df.reset_index(drop = True)
+    for index, row in df.iterrows():
+        df.at[index, "group_id"] = index
+    df["group_id"] = df["group_id"].astype(int)
+
+       
+    # Linking arcs together over multiple images.
+    df = ArcsJunction_Cluster(df)
+    
+    return df
+
+
+
+def ArcDetector_MP(image, k, elementSizes = [13], widths = [13], fwhms = [8], noiseSeeds = list(range(0,5)), verbose = False):
+
+    if verbose:
+        print("ArcDetector_MP: starting image " + str(k) + ".")
+
+    curves, gradientImage = ArcDetector_Convolve(image, elementSizes = elementSizes, widths = widths, fwhms = fwhms, noiseSeeds = noiseSeeds, noDetect = False)
+
+    # Extracting the scores.
+    scores = [[gradientImage[curve[i,0], curve[i,1]] for i in range(curve.shape[0])] for curve in curves]
+     
+    entries = []
+    for i, curve in enumerate(curves):
+        entry = {
+            "frame" : k,
+            "scores" : scores[i],
+            "points" : [(curve[i,0], curve[i,1]) for i in range(curve.shape[0])],
+        }
+        entries.append(entry)
+    
+    return entries
+    
+    
+def ArcDetector_Convolve(image, noiseQ = 50, elementSizes = [21], widths = [11], fwhms = [8], noiseSeeds = [], noDetect = False, noError = False, weightedNoise = False, elementStyle = "angled", alreadyMade = True):
+    
+   
+    if image[image > 0].size == 0:
+        return [], image.copy()*0
+    
+    if len(noiseSeeds) == 0:
+        noiseSeeds = [-1]
+    
+    combinations = itertools.product(elementSizes, widths, fwhms, noiseSeeds)
+
+    noiseLevels = np.ones(image.shape) * np.percentile(image[image > 0], q = noiseQ)
+    
+    image_gradient_totals = []
+    for i, comb in enumerate(combinations):
+        image_gradient = GetImageGradient(image, comb, noiseLevels, noError = noError)
+        
+        image_gradient_totals.append(image_gradient.copy())
+    
+    
+    image_gradient_totals = np.asarray(image_gradient_totals)
+    if image_gradient_totals.ndim == 2:
+        image_gradient_totals = image_gradient_totals[np.newaxis,...]
+    
+    if noDetect:
+        return [], image_gradient
+    
+    
+    # Estimating the median background level.
+    backgroundLevel = np.percentile(image_gradient[image_gradient > 0], q = noiseQ)
+    threshold = backgroundLevel + (1 - 1/(4/3))*(np.max(image_gradient) - backgroundLevel)
+    image_gradient_mask = image_gradient * (image_gradient >= threshold)
+    
+
+    # Removing regions without a "bright" pixel.
+    regions, _ = scipy.ndimage.label(image_gradient_mask>0)
+    for regionId in range(1, np.max(regions)+1):
+        mask = regions==regionId
+        if np.max(mask*image_gradient_mask) < 0.5 :
+            image_gradient_mask = image_gradient_mask * (mask==0)
+    
+    
+    # Skeletonisation.
+    image_binary = (image_gradient_mask > 0)
+    skeleton = skimage.morphology.skeletonize(image_binary)
+    
+    # Finding the nodes in the skeleton, removing short curves, then repeating until all short curves are gone.
+    graph = sknw.build_sknw(skeleton, multi = True, ring = True, iso = False)
+            
+    curves = []
+    for count, (source,end) in enumerate(graph.edges()):
+        paths = graph[source][end]
+        for pathId in paths:
+            if "pts" not in paths[pathId]:
+                continue
+            ps = paths[pathId]["pts"]
+            curves.append(ps.copy())
+    
+    if len(curves) == 0:
+        return [], image_gradient
+    
+    
+    # Removing short curves.
+    pixelLimit = 5
+    for curve in curves:
+        if curve.shape[0] < pixelLimit:
+            for point in curve:
+                skeleton[point[0], point[1]] = 0
+    
+    # Removing not very "bright" curves.
+    for curve in curves:
+        if np.all(np.asarray([image_gradient_mask[pt[0], pt[1]] for pt in curve]) < 0.1) and medianImage == False:
+            for point in curve:
+                skeleton[point[0], point[1]] = 0
+            
+    graph = sknw.build_sknw(skeleton, multi=True, ring = True, iso = False)
+            
+            
+    # Attempt 2: fixing three-branch nodes.
+    graph = FixBranchingNodes(graph)
+    graph = MergeTwoBranches(graph)
+            
+    curves = []
+    for count, (source,end) in enumerate(graph.edges()):
+        paths = graph[source][end]
+        for pathId in paths:
+            if "pts" not in paths[pathId]:
+                continue
+            ps = paths[pathId]["pts"]
+            curves.append(ps.copy())
+
+    
+    
+    # Removing short curves.
+    pixelLimit = 20
+    curves = [curve for curve in curves if curve.shape[0] >= pixelLimit]
+
+    
+    
+    # curves_new = []
+    # for num, curve in enumerate(curves):  
+            
+        # breaks = FindRadiusOfCurvatureBreaks(curve, 5, 5)
+        
+        # if len(breaks) == 0:
+            # curves_new.append(curve)
+            # continue
+        
+        # curves_split = [curve[i:j] for i, j in zip([0] + breaks, breaks + [None])]
+        
+        # curves_new.extend(curves_split)
+        
+    # curves = curves_new.copy()
+
+    curves = Curves_SplitDiscontinuities(curves)
+    
+    # Removing short curves.
+    pixelLimit = 10
+    curves = [curve for curve in curves if curve.shape[0] >= pixelLimit]
+    
+    # Merging curves that are close and aligned.
+    curves = Curves_MergeAligned(curves)
+    
+    # Splitting discontinuities.
+    curves = Curves_SplitDiscontinuities(curves)
+    
+    # Removing short curves.
+    pixelLimit = 15
+    curves = [curve for curve in curves if curve.shape[0] >= pixelLimit]   
+    
+    # Removing empty curves.
+    curves = [curve for curve in curves if curve.shape[0] > 0]
+
+    return curves, image_gradient
+    
+    
+def GetImageGradient(image, comb, noiseLevels, noError = False):
+    
+    # Creating the convolution element.
+    elementSize = comb[0]*2-1
+    width = comb[1]*2-1
+    fwhm = comb[2]
+    noiseSeed = comb[3]
+    std = fwhm/2.355
+    mean = int(width/2)
+    elementRow = np.asarray([ 1/(std * np.sqrt(2*np.pi)) * np.exp(-0.5 * (i - mean)**2/(std**2)) for i in range(width)])
+    elementRow /= np.max(elementRow)
+    element = np.tile(elementRow, (elementSize,1))
+    
+    
+    # If requested, adding random noise to the image.
+    if noiseSeed != -1:
+        np.random.seed(noiseSeed)
+        noiseMap = np.random.normal(loc = 0, scale = noiseLevels/2, size = (image.shape[0], image.shape[1]) )
+        image = image + noiseMap
+    
+    # Performing template matching with the element in the image at a number of rotation angles.
+    images_gradient = []
+    angles = np.arange(0, 180, 5)
+    
+    for angle in angles:
+        element_rot = scipy.ndimage.rotate(element, angle, reshape = False)
+        element_rot = element_rot[int(elementSize/4):3*int(elementSize/4)+1, int(width/4):3*int(width/4)+1]
+        image_gradient = skimage.feature.match_template(image, element_rot, pad_input = True)
+        image_gradient = image_gradient * (image_gradient > 0)
+        image_gradient = image_gradient * (image_gradient <= 1)
+        images_gradient.append(image_gradient.copy())
+    
+    image_gradient = np.max(np.asarray(images_gradient), axis = 0)
+    image_gradient[np.isfinite(image_gradient)==0] = 0
+    
+    # Rotating the image introduces artefacts at the corners; remove them.
+    x_c = int(image_gradient.shape[1]/2)
+    y_c = int(image_gradient.shape[0]/2)
+    r_max = np.max([x_c, y_c]) - np.max([comb[0], comb[1], comb[2]])
+    for y in range(image_gradient.shape[0]):
+        for x in range(image_gradient.shape[1]):
+            if (y-y_c)**2 + (x-x_c)**2 > r_max*r_max:
+                image_gradient[y,x] = 0
+                
+    if noError == False:
+        errorMask = (image_gradient > 1.5)
+        errorMask = scipy.ndimage.binary_dilation(errorMask, iterations = 5)
+        image_gradient = image_gradient * (errorMask == 0)
+
+    image_gradient = image_gradient * (image_gradient > 0)
+    
+    return image_gradient.copy()
+    
+    
+    
+
+def Curves_MergeAligned(curves):
+    noMoreMerges = False
+    while noMoreMerges == False:
+        curves_new = []
+        merges = []
+        curves_to_merge = []
+        connectingPoints = []
+        window = 10
+        foundMerge = False
+        for num1, curve1 in enumerate(curves):
+            for num2, curve2 in enumerate(curves):
+                if num2 <= num1:
+                    continue
+                
+                
+                # Finding the orientations that are closest: the final point of curve 1 and the first point of curve 2
+                minDist = 1000000
+                for flip in [(0,0), (0,1), (1,0), (1,1)]:
+                    if flip[0] == 1:
+                        curve1_temp = np.flip(curve1, axis = 0)
+                    else:
+                        curve1_temp = curve1.copy()
+                    
+                    if flip[1] == 1:
+                        curve2_temp = np.flip(curve2, axis = 0)
+                    else:
+                        curve2_temp = curve2.copy()
+                        
+                    dist = CartDist(curve1_temp[-1,0], curve2_temp[0,0], curve1_temp[-1,1], curve2_temp[0,1])
+                    
+                    if dist < minDist:
+                        bestFlip = flip
+                        minDist = dist
+                
+                if bestFlip[0] == 1:
+                    curve1_temp = np.flip(curve1, axis = 0)
+                else:
+                    curve1_temp = curve1.copy()
+                
+                if bestFlip[1] == 1:
+                    curve2_temp = np.flip(curve2, axis = 0)
+                else:
+                    curve2_temp = curve2.copy()
+                    
+                points1 = curve1_temp[np.arange(-1*window, 0), :]
+                points2 = curve2_temp[np.arange(0, window), :]
+                
+                        
+                dist = CartDist(points1[-1,0], points2[0,0], points1[-1,1], points2[0,1])
+                if dist > 15:
+                    continue
+                       
+                        
+                angle1 = LineAngle(points1[:,0], points1[:,1])
+                angle2 = LineAngle(points2[:,0], points2[:,1])
+                        
+                
+                angleDiff = np.min([
+                    np.abs(angle1 - angle2),
+                    np.abs(angle1 - angle2 - 360),
+                    np.abs(angle1 - angle2 + 360)
+                ])
+                
+                
+                if angleDiff > 30 and dist > 5:
+                    continue
+                if angleDiff > 45 and dist <= 5:
+                    continue
+                
+                angle_inter = LineAngle([points1[-1,0], points2[0,0]], [points1[-1,1], points2[0,1]])
+                
+                
+                angleDiff_inter = np.max([
+                    np.min([
+                        np.abs(angle1 - angle_inter),
+                        np.abs(angle1 - angle_inter - 360),
+                        np.abs(angle1 - angle_inter + 360)
+                    ]),
+                    np.min([
+                        np.abs(angle2 - angle_inter),
+                        np.abs(angle2 - angle_inter - 360),
+                        np.abs(angle2 - angle_inter + 360)
+                    ])
+                ])
+                     
+                if angleDiff_inter > 30 and dist > 5:
+                    continue
+                merges.append((num1, num2))
+                foundMerge = True
+                
+                # Adding the connecting points.
+                totalDist = CartDist(points1[-1,0], points2[0,0], points1[-1,1], points2[0,1])
+                
+                for t in np.linspace(0, totalDist, 50):
+                    
+                    y = points1[-1,0] + np.cos(angle_inter*np.pi/180)*t
+                    x = points1[-1,1] + np.sin(angle_inter*np.pi/180)*t
+                    
+                    
+                    x = int(np.round(x))
+                    y = int(np.round(y))
+                    
+                    if [y,x] not in connectingPoints:
+                        connectingPoints.append([y,x])
+                        
+                curves_to_merge.append( (curve1_temp, np.asarray(connectingPoints), curve2_temp))
+                        
+                if foundMerge == True:
+                    break
+                    
+            if foundMerge == True:
+                break
+                
+        if foundMerge == False:
+            noMoreMerges = True
+        
+        for i, curve in enumerate(curves):
+            if len(merges) == 0:
+                curves_new.append(curve)
+            else:
+                if i not in merges[0]:
+                    curves_new.append(curve)
+        
+        if len(merges) == 0:
+            curves = curves_new.copy()
+            break
+        
+        
+        curve_merge = np.concatenate(curves_to_merge[0], axis = 0)
+        
+        curves_new.append(curve_merge)
+        
+        curves = curves_new.copy()
+        
+    return curves
+ 
+ 
+def Curves_SplitDiscontinuities(curves):
+    # Splitting curves with discontinuities.
+    curves_new = []
+    for num, curve in enumerate(curves):
+        breaks = []
+        for i in range(1, curve.shape[0]):
+            dist = CartDist(curve[i,0], curve[i-1,0], curve[i,1], curve[i-1,1])
+            
+            if dist > np.sqrt(2)+0.01:
+                breaks.append(i)
+                
+        if len(breaks) == 0:
+            curves_new.append(curve)
+            continue
+                
+        curves_split = [curve[i:j] for i, j in zip([0] + breaks, breaks + [None])]
+        
+        # If the two split curves still touch, no need to split them.
+        stillTouching = False
+        for point1 in curves_split[0].tolist():
+            if stillTouching == True:
+                break
+            for point2 in curves_split[1].tolist():
+                if stillTouching == True:
+                    break
+                dist = CartDist(point1[0],point2[0],point1[1],point2[1])
+                
+                if dist <= np.sqrt(2)+0.01:
+                    stillTouching = True
+                    
+        if stillTouching == True:
+            curves_new.append(curve)
+            continue
+        
+        curves_new.extend(curves_split)
+    curves = curves_new.copy()
+
+    return curves
+    
+    
+def FixBranchingNodes(graph, pixelLimit = 10):
+    
+    combs = [(0,1), (1,2), (2,0)]
+    
+    nodesDone = []
+    notFinished = True
+    while notFinished == True:
+        for node in list(graph.nodes):
+            notFinished = False
+            if len(list(graph.edges(node))) != 3:
+                continue
+            
+            
+            if (node, set(list(graph.edges(node)))) in nodesDone:
+                continue
+                
+            nodesDone.append((node, set(list(graph.edges(node)))))
+            
+            # Checking that no looped curves are present.
+            edges = list(graph.edges(node))
+            if edges[0] == edges[1] or edges[1] == edges[2] or edges[2] == edges[0]:
+                continue
+                
+            branches_orig = list(graph.edges(node))
+            alreadyDone = []
+            branches = []
+            for branch in branches_orig:
+                if branch in alreadyDone:
+                    branches.append( (branch[0], branch[1], np.min(list(graph[branch[0]][branch[1]])) + 1) )
+                else:
+                    branches.append( (branch[0], branch[1], np.min(list(graph[branch[0]][branch[1]]))) )
+                alreadyDone.append(branch)
+                
+            
+            point_node = graph.nodes[node]["o"]
+            point_node = (int(np.round(point_node[0])), int(np.round(point_node[1])))
+            
+            angleDiffs = []
+            for comb in combs:
+                branch1 = branches[comb[0]]
+                branch2 = branches[comb[1]]
+                
+                path1 = graph[branch1[0]][branch1[1]][branch1[2]]
+                if "pts" not in path1:
+                    continue
+                pixels1 = path1["pts"]
+                if CartDist(pixels1[0,0],point_node[0],pixels1[0,1],point_node[1]) < 3:
+                    pixels1 = np.flip(pixels1, axis = 0)
+                path2 = graph[branch2[0]][branch2[1]][branch2[2]]
+                if "pts" not in path2:
+                    continue
+                pixels2 = path2["pts"]
+                if CartDist(pixels2[-1,0],point_node[0],pixels2[-1,1],point_node[1]) < 3:
+                    pixels2 = np.flip(pixels2, axis = 0)
+                    
+                pixels1 = pixels1[-1*np.min([pixelLimit, pixels1.size]):, :]
+                pixels2 = pixels2[:np.min([pixelLimit, pixels2.size]), :]
+                
+                angle1 = LineAngle(pixels1[:,0], pixels1[:,1])
+                angle2 = LineAngle(pixels2[:,0], pixels2[:,1])
+                
+                angleDiff = np.min([
+                    np.abs(angle1 - angle2),
+                    np.abs(angle1 - angle2 - 360),
+                    np.abs(angle1 - angle2 + 360),
+                ])
+                
+                angleDiffs.append(angleDiff)
+                
+            bestComb = combs[np.argmin(angleDiffs)]
+            
+            graph = MergeBranches(graph, branches[bestComb[0]], branches[bestComb[1]], node) 
+            
+            notFinished = True
+            break
+            
+    
+    return graph
+ 
+ 
+def MergeBranches(graph, branch1, branch2, mergeNode):
+    
+    if "pts" not in graph[branch1[0]][branch1[1]][branch1[2]]:
+        graph.remove_edge(branch1[0], branch1[1], key=branch1[2])
+        return graph
+    if "pts" not in graph[branch2[0]][branch2[1]][branch2[2]]:
+        graph.remove_edge(branch2[0], branch2[1], key=branch2[2])
+        return graph
+    
+    nodes_other = []
+    nodes = [branch1[0], branch2[0], branch1[1], branch2[1]]
+    
+    
+    nodes_other = [node for node in nodes if node != mergeNode]
+    
+    if len(nodes_other) != 2:
+        return graph
+    
+    if nodes_other[0] != nodes_other[1]:
+        
+        graph.add_edge(nodes_other[0], nodes_other[1])
+        
+        graph[nodes_other[0]][nodes_other[1]][0]["pts"] = np.concatenate((graph[branch1[0]][branch1[1]][branch1[2]]["pts"], graph[branch2[0]][branch2[1]][branch2[2]]["pts"]), axis = 0)
+    
+    graph.remove_edge(branch1[0], branch1[1], key=branch1[2])
+    graph.remove_edge(branch2[0], branch2[1], key=branch2[2])
+    
+    return graph
+    
+    
+def FindRadiusOfCurvatureBreaks(series, window = 3, breakRad = 5):
+    series = np.asarray(series)
+    
+    if len(series.shape) != 2:
+        raise Exception("Wrong number of dimensions from series!")
+    if series.shape[1] != 2:
+        raise Exception("Wrong shape from series!")
+    
+    i_list = []
+    rs = []
+    for i in range(window, series.shape[0]-window):
+        series_temp = series[i-window:i+window+1,:]
+        
+        _, _, r, _ = circle_fit.taubinSVD(series_temp)
+        
+        if r > 20:
+            r = 20
+        
+        i_list.append(i)
+        rs.append(r)
+    
+    peaks = []
+    for i, r in enumerate(rs):
+        if i == 0 or i == len(rs)-1:
+            continue
+            
+        if r < rs[i-1] and r < rs[i+1] and r < breakRad:
+            peaks.append(i+window)
+            
+    
+    return peaks
+    
+    
+def LineAngle(xs, ys):
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    
+    if xs.size != ys.size:
+        raise Exception("LineAngle: xs and ys need to be same size!")
+    
+    
+    steps_complex = [complex(ys[i+1] - ys[i], xs[i+1] - xs[i]) for i in range(xs.size-1)]
+    steps_complex_strip = [step for step in steps_complex if abs(step) < 5]
+    if len(steps_complex_strip) == 0:
+        steps_complex_strip = steps_complex
+    step_avr = np.mean(steps_complex_strip)
+    
+    angle = np.arctan2(step_avr.real, step_avr.imag)*180/np.pi
+    
+    
+    
+    if angle < 0:
+        angle = angle + 360
+    if angle > 360:
+        angle = angle - 360
+        
+    return angle
+    
+    
+def MergeTwoBranches(graph, pixelLimit = 10):
+    notFinished = True
+    nodesDone = []
+    while notFinished == True:
+        for node in list(graph.nodes):
+            notFinished = False
+            if len(list(graph.edges(node))) != 2:
+                continue
+                
+            if (node, set(list(graph.edges(node)))) in nodesDone:
+                continue
+                
+            nodesDone.append((node, set(list(graph.edges(node)))))
+            
+            # Checking that no looped curves are present.
+            edges = list(graph.edges(node))
+            if edges[0] == edges[1]:
+                continue
+                
+            branches_orig = list(graph.edges(node))
+            alreadyDone = []
+            branches = []
+            for branch in branches_orig:
+                if branch in alreadyDone:
+                    branches.append( (branch[0], branch[1], np.min(list(graph[branch[0]][branch[1]])) + 1) )
+                else:
+                    branches.append( (branch[0], branch[1], np.min(list(graph[branch[0]][branch[1]]))) )
+                alreadyDone.append(branch)
+            
+            
+            point_node = graph.nodes[node]["o"]
+            point_node = (int(np.round(point_node[0])), int(np.round(point_node[1])))
+            
+            branch1 = branches[0]
+            branch2 = branches[1]
+            
+            if "pts" not in graph[branch1[0]][branch1[1]][branch1[2]]:
+                graph.remove_edge(branch1[0], branch1[1], key=branch1[2])
+                continue
+            if "pts" not in graph[branch2[0]][branch2[1]][branch2[2]]:
+                graph.remove_edge(branch2[0], branch2[1], key=branch2[2])
+                continue
+            
+            pixels1 = graph[branch1[0]][branch1[1]][branch1[2]]["pts"]
+            if CartDist(pixels1[0,0], point_node[0], pixels1[0,1], point_node[1]) < 3:
+                pixels1 = np.flip(pixels1, axis = 0)
+            pixels2 = graph[branch2[0]][branch2[1]][branch2[2]]["pts"]
+            if CartDist(pixels2[-1,0], point_node[0], pixels2[-1,1], point_node[1]) < 3:
+                pixels2 = np.flip(pixels2, axis = 0)
+                
+            pixels1 = pixels1[-1*pixelLimit:, :]
+            pixels2 = pixels2[:pixelLimit, :]
+            
+            angle1 = LineAngle(pixels1[:,0], pixels1[:,1])
+            angle2 = LineAngle(pixels2[:,0], pixels2[:,1])
+            
+            angleDiff = np.min([
+                np.abs(angle1 - angle2),
+                np.abs(angle1 - angle2 - 180),
+                np.abs(angle1 - angle2 + 180),
+            ])
+                
+            if angleDiff > 30:
+                continue
+            
+            graph = MergeBranches(graph, branch1, branch2, node)
+            
+            notFinished = True
+            break
+        
+        
+    return graph
+    
+    
+def PlotArcs(images, df):
+    
+    cmap = "Greys_r"
+    
+    colours = distinctipy.get_colors(np.max(df["group_id"])+1)
+    
+    if images.ndim == 2:
+        images = images[np.newaxis,...]
+    
+    images_output = matplotlib.cm.get_cmap(cmap)(plt.Normalize(np.min(images), np.max(images))(images))
+    
+    for index, row in df.iterrows():
+        k = row["frame"]
+        points = row["points"]
+        colour = np.concatenate( (colours[row["group_id"]], np.array([1])), axis = 0 )
+        
+        for point in points:
+            images_output[k,point[0],point[1],:] = np.array(colour)
+            
+    return images_output
+    
+    
+def ArcsJunction_Cluster(df, maxOcclusion = 3):
+
+    # Making a distance matrix.
+    distMatrix = np.zeros( (np.max(df.index)+1, np.max(df.index)+1), dtype = float )+10000
+    
+    # Calculating distances.
+    for count, (index1, index2) in enumerate(itertools.product(list(df.index), list(df.index))):
+        
+        if index2 <= index1:
+            continue
+            
+        if df.at[index1, "frame"] == df.at[index2, "frame"]:
+            continue
+            
+        if abs(df.at[index1, "frame"] - df.at[index2, "frame"]) > maxOcclusion:
+            continue
+            
+            
+        points1 = np.asarray(df.at[index1, "points"])
+        points2 = np.asarray(df.at[index2, "points"])
+        
+        dists = scipy.spatial.distance.cdist(np.asarray(points1), np.asarray(points2))
+        
+        dist = np.mean([
+            np.median(np.min(dists, axis = 0)),
+            np.median(np.min(dists, axis = 1))
+        ])
+        
+        distMatrix[index1, index2] = dist
+        
+        
+    # Performing the clustering.
+    
+    distMatrix = np.min( np.concatenate( (distMatrix[...,np.newaxis], distMatrix.T[...,np.newaxis]), axis = 2 ), axis = 2)
+    
+    hdb = HDBSCAN(min_cluster_size = 2, cluster_selection_epsilon = 3, metric = "precomputed", copy = True)
+    hdb.fit(distMatrix)
+    clusters = hdb.labels_
+    
+    
+    clusterSizes = np.asarray([np.sum(clusters==clus) for clus in clusters])
+    
+    for i in range(clusters.size):
+        df.at[i, "group_id"] = clusters[i]
+        
+    df = df[df["group_id"] != -1]
+    
+    return df
+    
+    
+def CartDist(x1,x2,y1,y2):
+    
+    return np.sqrt( (float(x1) - float(x2))**2 + (float(y1) - float(y2))**2 )
